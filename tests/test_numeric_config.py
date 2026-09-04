@@ -24,7 +24,8 @@ def validate(util: str, model: str, seqs: str, batch: str) -> subprocess.Complet
     script = (
         guard_source()
         + '\nGPU_MEM_UTIL="$1"; MAX_MODEL_LEN="$2"; MAX_NUM_SEQS="$3"; '
-        + 'MAX_NUM_BATCHED_TOKENS="$4"; GLM53_SPINWAIT_MS=stock\n'
+        + 'MAX_NUM_BATCHED_TOKENS="$4"; GLM53_SPINWAIT_MS=stock; '
+        + 'GLM53_MIXED_PREFILL_MAX_WAIT_S=30\n'
         + 'validate_numeric_config || exit $?\n'
         + 'printf "%s|%s|%s|%s\\n" "$GPU_MEM_UTIL" "$MAX_MODEL_LEN" '
         + '"$MAX_NUM_SEQS" "$MAX_NUM_BATCHED_TOKENS"\n'
@@ -69,7 +70,8 @@ def validate_enum(value: str | None) -> subprocess.CompletedProcess[str]:
     script = (
         guard_source()
         + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; '
-        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_SPINWAIT_MS=stock\n'
+        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_SPINWAIT_MS=stock; '
+        + 'GLM53_MIXED_PREFILL_MAX_WAIT_S=30\n'
         + 'validate_numeric_config || exit $?\n'
         + 'printf "%s\\n" "${GLM53_INDEXER_WORKSPACE-unset}"\n'
     )
@@ -103,7 +105,8 @@ def validate_spinwait(value: str | None) -> subprocess.CompletedProcess[str]:
     script = (
         guard_source()
         + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; '
-        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock\n'
+        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock; '
+        + 'GLM53_MIXED_PREFILL_MAX_WAIT_S=30\n'
         + 'validate_numeric_config || exit $?\n'
         + 'printf "%s\\n" "${GLM53_SPINWAIT_MS-unset}"\n'
     )
@@ -129,6 +132,35 @@ def test_spinwait_numeric_contract() -> None:
         assert "GLM53_SPINWAIT_MS must" in result.stderr, bad
 
 
+def validate_mixed_prefill_wait(value: str) -> subprocess.CompletedProcess[str]:
+    script = (
+        guard_source()
+        + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; '
+        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock; '
+        + 'GLM53_SPINWAIT_MS=stock; GLM53_MIXED_PREFILL_MAX_WAIT_S="$1"\n'
+        + 'validate_numeric_config || exit $?\n'
+        + 'printf "%s\\n" "$GLM53_MIXED_PREFILL_MAX_WAIT_S"\n'
+    )
+    return subprocess.run(
+        ["bash", "-c", script, "test", value],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+
+
+def test_mixed_prefill_wait_numeric_contract() -> None:
+    for raw, canonical in (("1", "1"), ("030", "30"), ("3600", "3600")):
+        result = validate_mixed_prefill_wait(raw)
+        assert result.returncode == 0, (raw, result.stderr)
+        assert result.stdout.strip() == canonical, (raw, result.stdout)
+    for bad in ("", "0", "3601", "-1", "1.5", "nan", " 30", "30 "):
+        result = validate_mixed_prefill_wait(bad)
+        assert result.returncode == 2, (bad, result.returncode, result.stdout)
+        assert "GLM53_MIXED_PREFILL_MAX_WAIT_S must" in result.stderr, bad
+
+
 def test_restart_validates_before_stop() -> None:
     source = START.read_text()
     main = source.index("main() {")
@@ -142,5 +174,6 @@ if __name__ == "__main__":
     test_decimal_normalization()
     test_indexer_workspace_enum()
     test_spinwait_numeric_contract()
+    test_mixed_prefill_wait_numeric_contract()
     test_restart_validates_before_stop()
     print("numeric config tests: PASS")

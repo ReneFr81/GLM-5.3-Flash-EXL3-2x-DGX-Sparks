@@ -7,14 +7,18 @@ FLASHINFER_MLA_SPARSE_SM120 prefill chunk (~1.5 s). Decode still runs, but
 at ~5 tok/s instead of ~50.
 
 A 128-token mixed cap is not enough on 80k KV: the indexer has a large
-per-step cost, so mixed decode stays ~10 tok/s. Default is therefore to
-skip scheduling that prefill this step (it resumes when no peer is
-decoding). Solo prefill is unchanged (1024).
+per-step cost, so mixed decode stays ~10 tok/s. The normal policy therefore
+skips that prefill briefly, but releases the floor after a bounded wait so a
+long decode cannot starve every newer request. Solo prefill is unchanged.
 
 GLM53_MIXED_PREFILL_CHUNK:
   skip / -1  — do not mix prefill with decode (default)
   N>0        — cap mixed prefill chunks to N tokens (128 still stalls ~10 tok/s)
   0 / off    — disable
+
+GLM53_MIXED_PREFILL_MAX_WAIT_S:
+  N>0        — stop applying the mixed-prefill floor once this request has
+               waited N seconds (default 30)
 
 Fail closed if the vLLM scheduler anchors drift.
 """
@@ -31,9 +35,39 @@ P = Path(
     )
 )
 MARK = "# [glm53-decode-floor]"
+FAIRNESS_MARK = "# [glm53-bounded-fairness]"
 
 IMPORT_OLD = "import itertools\nimport time\n"
 IMPORT_NEW = "import itertools\nimport os\nimport time\n"
+
+LEGACY_HELPER = '''
+def _glm53_mixed_prefill_policy(running, current):
+    """Mixed-step prefill policy when a peer in `running` is decoding.
+
+    None = no extra policy. 0 = skip this prefill this step. N>0 = cap.
+    """
+    raw = os.environ.get("GLM53_MIXED_PREFILL_CHUNK", "skip").strip().lower()
+    if raw in ("0", "off", "no"):
+        return None
+    if raw in ("skip", "-1"):
+        cap = 0
+    else:
+        try:
+            cap = int(raw)
+        except ValueError:
+            cap = 0
+        if cap <= 0:
+            return None
+    cur_id = getattr(current, "request_id", None)
+    for r in running:
+        if r is current or getattr(r, "request_id", None) == cur_id:
+            continue
+        if r.num_computed_tokens >= r.num_prompt_tokens:
+            return cap
+    return None
+
+
+'''
 
 HELPER = '''
 def _glm53_mixed_prefill_policy(running, current):
@@ -53,6 +87,19 @@ def _glm53_mixed_prefill_policy(running, current):
             cap = 0
         if cap <= 0:
             return None
+    try:  # [glm53-bounded-fairness]
+        max_wait_s = float(
+            os.environ.get("GLM53_MIXED_PREFILL_MAX_WAIT_S", "30")
+        )
+    except ValueError:
+        max_wait_s = 30.0
+    arrival_time = getattr(current, "arrival_time", None)
+    if (
+        max_wait_s > 0
+        and arrival_time is not None
+        and time.time() - arrival_time >= max_wait_s
+    ):
+        return None
     cur_id = getattr(current, "request_id", None)
     for r in running:
         if r is current or getattr(r, "request_id", None) == cur_id:
@@ -119,7 +166,14 @@ def main() -> int:
         raise SystemExit(f"missing {P}")
     text = P.read_text()
     if MARK in text:
-        print(f"{P.name}: {MARK} already present — skipping")
+        if FAIRNESS_MARK in text:
+            print(f"{P.name}: {MARK} already present — skipping")
+            return 0
+        text = replace_once(
+            text, LEGACY_HELPER, HELPER, "legacy decode-floor helper"
+        )
+        P.write_text(text)
+        print(f"upgraded {P.name} with bounded mixed-prefill fairness")
         return 0
     if "import os\n" not in text.split("import time\n", 1)[0]:
         text = replace_once(text, IMPORT_OLD, IMPORT_NEW, "import os")
@@ -132,7 +186,11 @@ def main() -> int:
     text = replace_once(text, WAITING_OLD, WAITING_NEW, "waiting-prefill")
     P.write_text(text)
     cap = os.environ.get("GLM53_MIXED_PREFILL_CHUNK", "skip")
-    print(f"patched {P.name} (mixed prefill policy={cap})")
+    max_wait = os.environ.get("GLM53_MIXED_PREFILL_MAX_WAIT_S", "30")
+    print(
+        f"patched {P.name} "
+        f"(mixed prefill policy={cap}, max wait={max_wait}s)"
+    )
     return 0
 
 

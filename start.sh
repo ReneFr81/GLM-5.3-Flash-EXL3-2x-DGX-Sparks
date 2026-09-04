@@ -252,6 +252,8 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
 # skip = do not mix; N>0 = cap tokens; 0 = off.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# Release the decode floor after a bounded per-request wait.
+GLM53_MIXED_PREFILL_MAX_WAIT_S="${GLM53_MIXED_PREFILL_MAX_WAIT_S:-30}"
 # Sparse-indexer prefill gather workspace (overlay/patch_indexer_workspace.py).
 # stock = max_model_len * 40 entries (5036.40 MB locked at 1M, measured);
 # rightsize = the legal per-step maximum, ~+26% KV. Default applies only
@@ -361,6 +363,7 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
+    _glm53_canonical_positive_int GLM53_MIXED_PREFILL_MAX_WAIT_S "$GLM53_MIXED_PREFILL_MAX_WAIT_S" 3600 || return
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-stock}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
@@ -1170,6 +1173,7 @@ launch_cluster() {
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_MIXED_PREFILL_MAX_WAIT_S=$GLM53_MIXED_PREFILL_MAX_WAIT_S"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"

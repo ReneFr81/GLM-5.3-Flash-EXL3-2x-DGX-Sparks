@@ -532,7 +532,8 @@ that are now documented/enforced:
 | `MAX_MODEL_LEN` | `1000000` | default context. Pool size varies with MNBT, activation/graph reservations and hybrid block geometry |
 | `MAX_NUM_SEQS` | `4` | decode batch; MTP adds k+1 tokens/seq |
 | `MAX_NUM_BATCHED_TOKENS` | `7168` | current maintainer default at `MAX_NUM_SEQS=4`. MNBT 2048 was the clean PR77 A/B configuration and the best measured balance on an independent `MAX_NUM_SEQS=16` geometry. Tune per deployment; change after a repeated same-kit comparison |
-| `GLM53_MIXED_PREFILL_CHUNK` | `skip` | do not mix a peer prefill into a decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays MNBT (7168) |
+| `GLM53_MIXED_PREFILL_CHUNK` | `skip` | initially keep a peer prefill out of an active decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays MNBT (7168) |
+| `GLM53_MIXED_PREFILL_MAX_WAIT_S` | `30` | release the decode floor for a request after this many seconds, preventing a long decode from starving later prefills |
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `GLM53_INDEXER_WORKSPACE` | `stock` | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
 | `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
