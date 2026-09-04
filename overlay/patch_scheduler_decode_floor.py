@@ -42,9 +42,81 @@ P = Path(
     )
 )
 MARK = "# [glm53-decode-floor]"
+V2_MARK = "[glm53-decode-floor-v2]"
 
 IMPORT_OLD = "import itertools\nimport time\n"
 IMPORT_NEW = "import itertools\nimport os\nimport time\n"
+
+LEGACY_POLICY_SOURCE = '''
+def _glm53_mixed_prefill_policy(running, current):
+    """Mixed-step prefill policy when a peer in `running` is decoding.
+
+    None = no extra policy. 0 = skip this prefill this step. N>0 = cap.
+    """
+    raw = os.environ.get("GLM53_MIXED_PREFILL_CHUNK", "skip").strip().lower()
+    if raw in ("0", "off", "no"):
+        return None
+    if raw in ("skip", "-1"):
+        cap = 0
+    else:
+        try:
+            cap = int(raw)
+        except ValueError:
+            cap = 0
+        if cap <= 0:
+            return None
+    cur_id = getattr(current, "request_id", None)
+    for r in running:
+        if r is current or getattr(r, "request_id", None) == cur_id:
+            continue
+        if r.num_computed_tokens >= r.num_prompt_tokens:
+            return cap
+    return None
+
+
+'''
+
+INTERMEDIATE_POLICY_SOURCE = '''
+def _glm53_mixed_prefill_policy(running, current):
+    """Mixed-step prefill policy when a peer in `running` is decoding.
+
+    None = no extra policy. 0 = skip this prefill this step. N>0 = cap.
+    """
+    raw = os.environ.get("GLM53_MIXED_PREFILL_CHUNK", "skip").strip().lower()
+    if raw in ("0", "off", "no"):
+        return None
+    if raw in ("skip", "-1"):
+        cap = 0
+    else:
+        try:
+            cap = int(raw)
+        except ValueError:
+            cap = 0
+        if cap <= 0:
+            return None
+    try:  # [glm53-bounded-fairness]
+        max_wait_s = float(
+            os.environ.get("GLM53_MIXED_PREFILL_MAX_WAIT_S", "30")
+        )
+    except ValueError:
+        max_wait_s = 30.0
+    arrival_time = getattr(current, "arrival_time", None)
+    if (
+        max_wait_s > 0
+        and arrival_time is not None
+        and time.time() - arrival_time >= max_wait_s
+    ):
+        return None
+    cur_id = getattr(current, "request_id", None)
+    for r in running:
+        if r is current or getattr(r, "request_id", None) == cur_id:
+            continue
+        if r.num_computed_tokens >= r.num_prompt_tokens:
+            return cap
+    return None
+
+
+'''
 
 HELPER = '''
 _GLM53_GATE_CFG = None
@@ -199,6 +271,32 @@ WAITING_NEW = """                    threshold = self.scheduler_config.long_pref
                     # chunked prefill has to be enabled explicitly to allow
 """
 
+LEGACY_RUNNING_NEW = """            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens = min(
+                num_new_tokens, token_budget, input_budget - draft_slots
+            )
+            mixed_cap = _glm53_mixed_prefill_policy(self.running, request)  # [glm53-decode-floor]
+            if mixed_cap is not None and request.num_computed_tokens < request.num_prompt_tokens:
+                num_new_tokens = min(num_new_tokens, mixed_cap)
+
+            # Make sure the input position does not exceed the max model len.
+"""
+
+LEGACY_WAITING_NEW = """                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
+                        num_new_tokens = threshold
+                    mixed_cap = _glm53_mixed_prefill_policy(self.running, request)  # [glm53-decode-floor]
+                    if mixed_cap is not None and num_computed_tokens < request.num_prompt_tokens:
+                        if mixed_cap <= 0:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        num_new_tokens = min(num_new_tokens, mixed_cap)
+
+                    # chunked prefill has to be enabled explicitly to allow
+"""
+
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     n = text.count(old)
@@ -212,7 +310,23 @@ def main() -> int:
         raise SystemExit(f"missing {P}")
     text = P.read_text()
     if MARK in text:
-        print(f"{P.name}: {MARK} already present — skipping")
+        if V2_MARK in text:
+            print(f"{P.name}: {V2_MARK} already present — skipping")
+            return 0
+        old_helper = (
+            INTERMEDIATE_POLICY_SOURCE
+            if "# [glm53-bounded-fairness]" in text
+            else LEGACY_POLICY_SOURCE
+        )
+        text = replace_once(text, old_helper, HELPER, "legacy helper")
+        text = replace_once(
+            text, LEGACY_RUNNING_NEW, RUNNING_NEW, "legacy running-prefill"
+        )
+        text = replace_once(
+            text, LEGACY_WAITING_NEW, WAITING_NEW, "legacy waiting-prefill"
+        )
+        P.write_text(text)
+        print(f"upgraded {P.name} to the mixed-prefill v2 gate")
         return 0
     if "import os\n" not in text.split("import time\n", 1)[0]:
         text = replace_once(text, IMPORT_OLD, IMPORT_NEW, "import os")
