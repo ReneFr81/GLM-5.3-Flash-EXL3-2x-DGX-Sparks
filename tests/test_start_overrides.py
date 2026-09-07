@@ -104,8 +104,33 @@ def test_spinwait_caller_capture_is_setness_aware() -> None:
     assert _run_preamble("", {}, probe) == "V=[UNSET]"
 
 
+def test_long_prefill_threshold_caller_override_wins() -> None:
+    probe = '\nprintf "V=[%s]\\n" "${LONG_PREFILL_TOKEN_THRESHOLD-UNSET}"\n'
+    env_file = "LONG_PREFILL_TOKEN_THRESHOLD=1024\n"
+
+    assert _run_preamble(env_file, {}, probe) == "V=[1024]"
+    assert _run_preamble(
+        env_file, {"LONG_PREFILL_TOKEN_THRESHOLD": "0"}, probe
+    ) == "V=[0]"
+    assert _run_preamble(
+        env_file, {"LONG_PREFILL_TOKEN_THRESHOLD": "512"}, probe
+    ) == "V=[512]"
+
+
+def test_mixed_prefill_chunk_inline_override_wins() -> None:
+    probe = ('\nprintf "GLM53_MIXED_PREFILL_CHUNK=%s\\n" '
+             '"${GLM53_MIXED_PREFILL_CHUNK:-unset}"\n')
+    assert _run_preamble(
+        "GLM53_MIXED_PREFILL_CHUNK=2\n",
+        {"GLM53_MIXED_PREFILL_CHUNK": "skip"},
+        probe,
+    ) == "GLM53_MIXED_PREFILL_CHUNK=skip"
+
+
 if __name__ == "__main__":
     test_max_num_seqs_inline_override_wins()
     test_indexer_workspace_caller_capture_is_setness_aware()
     test_spinwait_caller_capture_is_setness_aware()
+    test_long_prefill_threshold_caller_override_wins()
+    test_mixed_prefill_chunk_inline_override_wins()
     print("start.sh caller override regression OK")

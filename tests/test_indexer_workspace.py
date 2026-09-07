@@ -785,7 +785,7 @@ def test_recipe_wiring_if_present() -> None:
         return
     launcher = start.read_text()
     image = dockerfile.read_text()
-    assert 'GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-stock}"' in launcher
+    assert 'GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-rightsize}"' in launcher
     assert '_cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"' in launcher
     # Setness-aware capture: an explicitly empty caller value must survive the
     # .env source and reach the enum guard, not be swallowed by a .env value.

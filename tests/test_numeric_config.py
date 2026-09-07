@@ -118,6 +118,34 @@ def validate_spinwait(value: str | None) -> subprocess.CompletedProcess[str]:
     )
 
 
+def validate_long_prefill(value: str, batch: str = "7168") -> subprocess.CompletedProcess[str]:
+    script = (
+        guard_source()
+        + '\nGPU_MEM_UTIL=0.85; MAX_MODEL_LEN=850000; MAX_NUM_SEQS=4; '
+        + 'GLM53_INDEXER_WORKSPACE=rightsize; GLM53_SPINWAIT_MS=stock; '
+        + 'MAX_NUM_BATCHED_TOKENS="$1"; LONG_PREFILL_TOKEN_THRESHOLD="$2"\n'
+        + 'validate_numeric_config || exit $?\n'
+        + 'printf "%s\\n" "$LONG_PREFILL_TOKEN_THRESHOLD"\n'
+    )
+    return subprocess.run(
+        ["bash", "-c", script, "test", batch, value],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+
+
+def test_long_prefill_threshold_contract() -> None:
+    for raw in ("0", "1024", "7168"):
+        result = validate_long_prefill(raw)
+        assert result.returncode == 0, (raw, result.stderr)
+        assert result.stdout.strip() == raw
+    for bad in ("", "-1", "1.5", "1024 ", "7169"):
+        result = validate_long_prefill(bad)
+        assert result.returncode == 2, (bad, result.returncode, result.stdout, result.stderr)
+
+
 def test_spinwait_numeric_contract() -> None:
     for raw, canonical in (("stock", "stock"), ("1", "1"), ("016", "16"), ("1000", "1000")):
         result = validate_spinwait(raw)
@@ -142,5 +170,6 @@ if __name__ == "__main__":
     test_decimal_normalization()
     test_indexer_workspace_enum()
     test_spinwait_numeric_contract()
+    test_long_prefill_threshold_contract()
     test_restart_validates_before_stop()
     print("numeric config tests: PASS")

@@ -86,11 +86,21 @@ _cli_indexer_workspace_set="${GLM53_INDEXER_WORKSPACE+1}"
 _cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
+_cli_long_prefill_threshold_set="${LONG_PREFILL_TOKEN_THRESHOLD+1}"
+_cli_long_prefill_threshold="${LONG_PREFILL_TOKEN_THRESHOLD-}"
+_cli_chunk="${GLM53_MIXED_PREFILL_CHUNK-}"
+_cli_warm="${GLM53_MIXED_PREFILL_WARM_TOKENS-}"
+_cli_wait="${GLM53_MIXED_PREFILL_MAX_WAIT_MS-}"
+_cli_late="${GLM53_MIXED_PREFILL_LATE_CAP-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
+[ -n "${_cli_chunk}" ] && GLM53_MIXED_PREFILL_CHUNK="$_cli_chunk"
+[ -n "${_cli_warm}" ] && GLM53_MIXED_PREFILL_WARM_TOKENS="$_cli_warm"
+[ -n "${_cli_wait}" ] && GLM53_MIXED_PREFILL_MAX_WAIT_MS="$_cli_wait"
+[ -n "${_cli_late}" ] && GLM53_MIXED_PREFILL_LATE_CAP="$_cli_late"
 [ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
 [ -n "${_cli_eager}" ] && ENFORCE_EAGER="$_cli_eager"
 [ -n "${_cli_fused}" ] && EXL3_FUSED_MOE="$_cli_fused"
@@ -113,6 +123,7 @@ set +a
 [ -n "${_cli_ablit_alpha}" ] && ABLIT_ALPHA="$_cli_ablit_alpha"
 [ -n "${_cli_ablit_mtp}" ] && ABLIT_INCLUDE_MTP="$_cli_ablit_mtp"
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
+[ -n "${_cli_long_prefill_threshold_set}" ] && LONG_PREFILL_TOKEN_THRESHOLD="$_cli_long_prefill_threshold"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 
 # ----------------------------- configuration -------------------------------
@@ -191,6 +202,13 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
 # E2 one-shot 2026-09-01: 7168 keep (100k ~1148 / 300k ~1107); 2048/3548 similar or slower.
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-7168}"
+# Per-step prefill cap. Unset/0 = stock: one chunked prefill claims the whole
+# token budget for its entire duration, so a long cold prefill freezes every
+# other session until it finishes (measured 440 s on a warm 325k peer). 1024
+# leaves budget for other requests: the same peer stayed at 17.9-24.9 s with
+# zero evictions, costing the long prefill ~10% (447 -> 494 s) and a SOLO
+# prefill nothing (424.9 -> 435.9 s, within noise). Set 0 to restore stock.
+LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-1024}"
 CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$SCRIPT_DIR/files/chat_template.jinja}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-/opt/glm53/chat_template.jinja}"
 VIDEO_PATCH_HOST="${VIDEO_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm_video_placeholders.py}"
@@ -272,6 +290,11 @@ GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
 # skip = do not mix; N>0 = cap tokens; 0 = off.
 GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# Gate v2: cached follow-ups (uncached remainder <= WARM_TOKENS) bypass `skip`; held
+# cold prefills proceed after MAX_WAIT_MS under LATE_CAP tokens/step (0 = wait forever).
+GLM53_MIXED_PREFILL_WARM_TOKENS="${GLM53_MIXED_PREFILL_WARM_TOKENS:-3584}"
+GLM53_MIXED_PREFILL_MAX_WAIT_MS="${GLM53_MIXED_PREFILL_MAX_WAIT_MS:-1500}"
+GLM53_MIXED_PREFILL_LATE_CAP="${GLM53_MIXED_PREFILL_LATE_CAP:-512}"
 # Sparse-indexer prefill gather workspace (overlay/patch_indexer_workspace.py).
 # stock = max_model_len * 40 entries (5036.40 MB locked at 1M, measured);
 # rightsize = the legal per-step maximum, ~+26% KV (default since 2026-09-07:
@@ -382,9 +405,35 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
+    case "${LONG_PREFILL_TOKEN_THRESHOLD-0}" in
+        ''|*[!0-9]*)
+            echo "LONG_PREFILL_TOKEN_THRESHOLD must be a base-10 integer >= 0 (0 = stock) (got: ${LONG_PREFILL_TOKEN_THRESHOLD-})" >&2
+            return 2 ;;
+    esac
+    if [ "${LONG_PREFILL_TOKEN_THRESHOLD:-0}" -gt "${MAX_NUM_BATCHED_TOKENS}" ] 2>/dev/null; then
+        echo "LONG_PREFILL_TOKEN_THRESHOLD (${LONG_PREFILL_TOKEN_THRESHOLD}) exceeds MAX_NUM_BATCHED_TOKENS (${MAX_NUM_BATCHED_TOKENS}); it would never bind" >&2
+        return 2
+    fi
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
+    # mixed-prefill gate v2 knobs (self-defaulting so the guard block runs standalone; 0 = feature off for the first two)
+    GLM53_MIXED_PREFILL_WARM_TOKENS="${GLM53_MIXED_PREFILL_WARM_TOKENS:-3584}"
+    GLM53_MIXED_PREFILL_MAX_WAIT_MS="${GLM53_MIXED_PREFILL_MAX_WAIT_MS:-1500}"
+    GLM53_MIXED_PREFILL_LATE_CAP="${GLM53_MIXED_PREFILL_LATE_CAP:-512}"
+    local _k _v
+    local _max
+    for _k in GLM53_MIXED_PREFILL_WARM_TOKENS GLM53_MIXED_PREFILL_MAX_WAIT_MS; do
+        _v="${!_k}"
+        [ "$_k" = GLM53_MIXED_PREFILL_WARM_TOKENS ] && _max=1000000 || _max=600000
+        if ! [[ "$_v" =~ ^[0-9]+$ ]] || [ "${#_v}" -gt 7 ] || [ "$((10#$_v))" -gt "$_max" ]; then
+            echo "$_k must be an integer between 0 and $_max (got: $_v)" >&2; return 2
+        fi
+    done
+    _glm53_canonical_positive_int GLM53_MIXED_PREFILL_LATE_CAP "$GLM53_MIXED_PREFILL_LATE_CAP" 8192 || return
+    if [ "$GLM53_MIXED_PREFILL_LATE_CAP" -lt 64 ]; then
+        echo "GLM53_MIXED_PREFILL_LATE_CAP must be between 64 and 8192 (got: $GLM53_MIXED_PREFILL_LATE_CAP)" >&2; return 2
+    fi
 }
 # GLM53 numeric config guard (end)
 
@@ -974,6 +1023,7 @@ ARGS=(
 [ -n "${GPU_MEM_UTIL:-}" ]  && ARGS+=(--gpu-memory-utilization "${GPU_MEM_UTIL}")
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
+[ "${LONG_PREFILL_TOKEN_THRESHOLD:-0}" != "0" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
@@ -1072,6 +1122,7 @@ ARGS=(
 [ -n "${GPU_MEM_UTIL:-}" ]  && ARGS+=(--gpu-memory-utilization "${GPU_MEM_UTIL}")
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
+[ "${LONG_PREFILL_TOKEN_THRESHOLD:-0}" != "0" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
@@ -1191,6 +1242,9 @@ launch_cluster() {
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_MIXED_PREFILL_WARM_TOKENS=$GLM53_MIXED_PREFILL_WARM_TOKENS"
+        -e "GLM53_MIXED_PREFILL_MAX_WAIT_MS=$GLM53_MIXED_PREFILL_MAX_WAIT_MS"
+        -e "GLM53_MIXED_PREFILL_LATE_CAP=$GLM53_MIXED_PREFILL_LATE_CAP"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
@@ -1233,6 +1287,7 @@ launch_cluster() {
     local v
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
+             LONG_PREFILL_TOKEN_THRESHOLD \
              KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
@@ -1315,6 +1370,7 @@ launch_cluster() {
         -e MAX_MODEL_LEN="$MAX_MODEL_LEN" -e GPU_MEM_UTIL="$GPU_MEM_UTIL" \
         -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
+        -e LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-0}" \
         -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
         -e DFLASH_TOKENS="${DFLASH_TOKENS:-7}" \
