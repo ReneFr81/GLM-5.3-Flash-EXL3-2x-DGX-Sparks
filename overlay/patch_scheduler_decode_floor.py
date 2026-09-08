@@ -74,6 +74,17 @@ def _glm53_mixed_prefill_policy(running, current):
     return None
 
 
+def _glm53_has_decoding_peer(running, current):
+    """Whether another live request has completed its prompt and is decoding."""
+    current_id = getattr(current, "request_id", None)
+    for request in running:
+        if request is current or getattr(request, "request_id", None) == current_id:
+            continue
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            return True
+    return False
+
+
 '''
 
 INTERMEDIATE_POLICY_SOURCE = '''
@@ -238,7 +249,10 @@ RUNNING_OLD = """            if 0 < self.scheduler_config.long_prefill_token_thr
             # Make sure the input position does not exceed the max model len.
 """
 
-RUNNING_NEW = """            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+RUNNING_NEW = """            if (
+                0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens
+                and _glm53_has_decoding_peer(self.running, request)
+            ):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
@@ -250,6 +264,7 @@ RUNNING_NEW = """            if 0 < self.scheduler_config.long_prefill_token_thr
             # Make sure the input position does not exceed the max model len.
 """
 
+
 WAITING_OLD = """                    threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -258,7 +273,7 @@ WAITING_OLD = """                    threshold = self.scheduler_config.long_pref
 """
 
 WAITING_NEW = """                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
+                    if 0 < threshold < num_new_tokens and _glm53_has_decoding_peer(self.running, request):
                         num_new_tokens = threshold
                     mixed_cap = _glm53_mixed_prefill_gate(self.running, request, num_computed_tokens)  # [glm53-decode-floor] [glm53-decode-floor-v2]
                     if mixed_cap is not None:
@@ -271,7 +286,10 @@ WAITING_NEW = """                    threshold = self.scheduler_config.long_pref
                     # chunked prefill has to be enabled explicitly to allow
 """
 
-LEGACY_RUNNING_NEW = """            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+LEGACY_RUNNING_NEW = """            if (
+                0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens
+                and _glm53_has_decoding_peer(self.running, request)
+            ):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
@@ -284,7 +302,7 @@ LEGACY_RUNNING_NEW = """            if 0 < self.scheduler_config.long_prefill_to
 """
 
 LEGACY_WAITING_NEW = """                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
+                    if 0 < threshold < num_new_tokens and _glm53_has_decoding_peer(self.running, request):
                         num_new_tokens = threshold
                     mixed_cap = _glm53_mixed_prefill_policy(self.running, request)  # [glm53-decode-floor]
                     if mixed_cap is not None and num_computed_tokens < request.num_prompt_tokens:
