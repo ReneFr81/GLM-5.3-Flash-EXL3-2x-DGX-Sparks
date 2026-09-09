@@ -1,0 +1,11 @@
+# Python-only decode upgrade on the validated E3 image; no CUDA rebuild.
+ARG BASE=contextivity/glm53-exl3:67b2a8e
+FROM ${BASE}
+COPY overlay/exl3.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/exl3.py
+COPY overlay /opt/glm53/decode-recipe/overlay
+COPY tests /opt/glm53/decode-recipe/tests
+RUN python3 /opt/glm53/decode-recipe/tests/test_adaptive_k_patch.py \
+    && python3 /opt/glm53/decode-recipe/tests/test_dense_fp8_patch.py \
+    && python3 /opt/glm53/decode-recipe/tests/test_mixed_prefill_gate_v2.py
+ARG GLM53_RECIPE_STAMP
+LABEL glm53.recipe.stamp=${GLM53_RECIPE_STAMP}
