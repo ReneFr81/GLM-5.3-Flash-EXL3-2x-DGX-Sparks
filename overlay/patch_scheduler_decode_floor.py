@@ -43,6 +43,21 @@ P = Path(
 )
 MARK = "# [glm53-decode-floor]"
 V2_MARK = "[glm53-decode-floor-v2]"
+DECODING_PEER_MARK = "[glm53-has-decoding-peer]"
+
+DECODING_PEER_HELPER = '''
+def _glm53_has_decoding_peer(running, current):
+    """Whether another live request has completed its prompt and is decoding."""
+    current_id = getattr(current, "request_id", None)
+    for request in running:
+        if request is current or getattr(request, "request_id", None) == current_id:
+            continue
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            return True
+    return False
+
+
+'''
 
 IMPORT_OLD = "import itertools\nimport time\n"
 IMPORT_NEW = "import itertools\nimport os\nimport time\n"
@@ -311,6 +326,13 @@ def main() -> int:
     text = P.read_text()
     if MARK in text:
         if V2_MARK in text:
+            if "def _glm53_has_decoding_peer(" not in text:
+                needle = "def _glm53_mixed_prefill_policy("
+                if text.count(needle) != 1:
+                    raise SystemExit(f"{P}: helper insert point not unique")
+                text = text.replace(needle, DECODING_PEER_HELPER + needle, 1)
+                P.write_text(text)
+                print(f"{P.name}: added missing decoding-peer helper")
             print(f"{P.name}: {V2_MARK} already present — skipping")
             return 0
         old_helper = (
