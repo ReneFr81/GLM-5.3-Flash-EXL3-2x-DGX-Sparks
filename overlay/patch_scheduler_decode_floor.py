@@ -74,17 +74,6 @@ def _glm53_mixed_prefill_policy(running, current):
     return None
 
 
-def _glm53_has_decoding_peer(running, current):
-    """Whether another live request has completed its prompt and is decoding."""
-    current_id = getattr(current, "request_id", None)
-    for request in running:
-        if request is current or getattr(request, "request_id", None) == current_id:
-            continue
-        if request.num_computed_tokens >= request.num_prompt_tokens:
-            return True
-    return False
-
-
 '''
 
 INTERMEDIATE_POLICY_SOURCE = '''
@@ -130,6 +119,17 @@ def _glm53_mixed_prefill_policy(running, current):
 '''
 
 HELPER = '''
+def _glm53_has_decoding_peer(running, current):
+    """Whether another live request has completed its prompt and is decoding."""
+    current_id = getattr(current, "request_id", None)
+    for request in running:
+        if request is current or getattr(request, "request_id", None) == current_id:
+            continue
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            return True
+    return False
+
+
 _GLM53_GATE_CFG = None
 _GLM53_FIRST_SEEN_FALLBACK = None   # WeakKeyDictionary used only if Request rejects attribute assignment
 
@@ -286,10 +286,7 @@ WAITING_NEW = """                    threshold = self.scheduler_config.long_pref
                     # chunked prefill has to be enabled explicitly to allow
 """
 
-LEGACY_RUNNING_NEW = """            if (
-                0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens
-                and _glm53_has_decoding_peer(self.running, request)
-            ):
+LEGACY_RUNNING_NEW = """            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
@@ -302,7 +299,7 @@ LEGACY_RUNNING_NEW = """            if (
 """
 
 LEGACY_WAITING_NEW = """                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens and _glm53_has_decoding_peer(self.running, request):
+                    if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
                     mixed_cap = _glm53_mixed_prefill_policy(self.running, request)  # [glm53-decode-floor]
                     if mixed_cap is not None and num_computed_tokens < request.num_prompt_tokens:
@@ -329,7 +326,27 @@ def main() -> int:
     text = P.read_text()
     if MARK in text:
         if V2_MARK in text:
-            print(f"{P.name}: {V2_MARK} already present — skipping")
+            # d83c40e added calls at both schedule sites but put the helper in
+            # LEGACY_POLICY_SOURCE instead of HELPER. A marker is not proof
+            # that the installed patch is complete. Repair that exact state,
+            # and migrate the older, unconditional v2 threshold sites.
+            original = text
+            peer_helper = HELPER.split("_GLM53_GATE_CFG = None", 1)[0]
+            if "def _glm53_has_decoding_peer(" not in text:
+                text = replace_once(text, "\n_GLM53_GATE_CFG = None", peer_helper + "_GLM53_GATE_CFG = None", "v2 helper")
+            for wanted, unguarded, label in (
+                (RUNNING_NEW, RUNNING_NEW.replace(
+                    "if (\n                0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens\n                and _glm53_has_decoding_peer(self.running, request)\n            ):",
+                    "if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:",
+                ), "running-prefill"),
+                (WAITING_NEW, WAITING_NEW.replace(" and _glm53_has_decoding_peer(self.running, request)", ""), "waiting-prefill"),
+            ):
+                if text.count(wanted) != 1:
+                    text = replace_once(text, unguarded, wanted, f"v2 {label}")
+            if text != original:
+                compile(text, str(P), "exec")
+                P.write_text(text)
+            print(f"{P.name}: {V2_MARK} complete (decoding-peer helper verified)")
             return 0
         old_helper = (
             INTERMEDIATE_POLICY_SOURCE
