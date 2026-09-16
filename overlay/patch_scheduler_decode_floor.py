@@ -1083,6 +1083,9 @@ def apply_v5(text: str) -> str:
 
 
 def main() -> int:
+    if os.environ.get("GLM53_DISABLE_SCHEDULER_PATCH", "0") == "1":
+        print(f"{P.name}: scheduler overlay disabled by GLM53_DISABLE_SCHEDULER_PATCH")
+        return 0
     if not P.is_file():
         raise SystemExit(f"missing {P}")
     text = P.read_text()
