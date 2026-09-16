@@ -384,6 +384,7 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # Empty uses the adapter default (1). Must be identical on both ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
 GLM53_COOP_GEOMETRY="${GLM53_COOP_GEOMETRY:-}"
+GLM53_DISABLE_SCHEDULER_PATCH="${GLM53_DISABLE_SCHEDULER_PATCH:-0}"
 # Empty leaves the template's omitted-effort fallback unchanged.
 GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # 1 = honour the per-request GPU prefix-cache no-store flag
@@ -1945,7 +1946,7 @@ launch_cluster() {
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
-             GLM53_COOP_GEOMETRY; do
+             GLM53_COOP_GEOMETRY GLM53_DISABLE_SCHEDULER_PATCH; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
     done
@@ -2127,6 +2128,7 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
+        -e GLM53_DISABLE_SCHEDULER_PATCH="$GLM53_DISABLE_SCHEDULER_PATCH" \
         -e MODEL_DIR="$MODEL_DIR" \
         -e VLLM_API_KEY \
         -e EXTRA_ARGS="${EXTRA_ARGS:-}" \
