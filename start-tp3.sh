@@ -108,12 +108,26 @@ _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
 _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
+_cli_overlay="${EXL3_OVERLAY_HOST-}"
+_cli_dense_fp8="${GLM53_DENSE_FP8-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
+# TP=3 does not inherit ABLIT=1 from the 2-node .env. Opt in from .env.tp3
+# or ABLIT=1 on the command line.
+ABLIT=0
+# TP=3 does not inherit the 2-node EXL3 overlay. That path is the TP2 coop
+# adapter (wrong ABI). Set EXL3_OVERLAY_HOST in .env.tp3 (or on the command
+# line) to opt in to a TP3-generated overlay.
+unset EXL3_OVERLAY_HOST
+# FAST/FAT (#182) stay on start.sh (TP=2) only.
+unset GLM53_EXL3_MOE_FAST
+unset GLM53_KDA_FP8_FAT
 # TP=3 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp3"
+unset GLM53_EXL3_MOE_FAST
+unset GLM53_KDA_FP8_FAT
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
 [ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
@@ -140,6 +154,8 @@ set +a
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
+[ -n "${_cli_overlay}" ] && EXL3_OVERLAY_HOST="$_cli_overlay"
+[ -n "${_cli_dense_fp8}" ] && GLM53_DENSE_FP8="$_cli_dense_fp8"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
@@ -281,6 +297,7 @@ STOP_PATCH_HOST="${STOP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_suppress_stops_in_
 SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode_floor.py}"
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
+PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
@@ -293,6 +310,9 @@ SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.p
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
+FLASHKDA_PATCH_HOST="$SCRIPT_DIR/overlay/patch_flashkda_tp3.py"
+HAREM_KDA_FLASHKDA="${HAREM_KDA_FLASHKDA:-0}"
+
 # Same defaults as start.sh. Docker -e VAR= (empty) hides the Python fallbacks
 # in overlay/patch_adaptive_k.py — EngineCore then dies on float('').
 GLM53_ADAPTIVE_K="${GLM53_ADAPTIVE_K:-off}"
@@ -580,6 +600,32 @@ _glm53_validate_mixed_prefill() {
     fi
 }
 
+# Prefix-cache retention intervals: "" (unset) and 0 pass; anything else is a
+# positive multiple of 3584, at most 1e6. Same rule as start.sh / the overlay.
+GLM53_APC_BLOCK_TOKENS=3584
+GLM53_APC_RETENTION_MAX=1000000
+_glm53_validate_retention_interval() {
+    local name="$1" value="$2" canonical
+    [ -n "$value" ] || return 0
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    canonical="$value"
+    while [ "${canonical#0}" != "$canonical" ]; do canonical="${canonical#0}"; done
+    [ -n "$canonical" ] || canonical=0
+    if [ "$canonical" != 0 ] \
+       && { [ "${#canonical}" -gt "${#GLM53_APC_RETENTION_MAX}" ] \
+            || [ "$canonical" -gt "$GLM53_APC_RETENTION_MAX" ] \
+            || [ $((canonical % GLM53_APC_BLOCK_TOKENS)) -ne 0 ]; }; then
+        echo "$name must be empty, 0, or a positive multiple of $GLM53_APC_BLOCK_TOKENS <= $GLM53_APC_RETENTION_MAX (got: $value)" >&2
+        return 2
+    fi
+    printf -v "$name" '%s' "$canonical"
+    # shellcheck disable=SC2163
+    export "$name"
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -597,13 +643,28 @@ validate_numeric_config() {
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
     _glm53_validate_mixed_prefill || return
-    if [ -n "${GLM53_APC_RETENTION_INTERVAL:-}" ]; then
-        echo "GLM53_APC_RETENTION_INTERVAL is supported only by start.sh (TP=2); unset it for start-tp3.sh" >&2
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL "${GLM53_APC_RETENTION_INTERVAL-}" || return
+    _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
+        echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
     fi
-    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
-        echo "GLM53_APC_RETENTION_INTERVAL_SWA is supported only by start.sh (TP=2); unset it for start-tp3.sh" >&2
-        return 2
+    if _glm53_coop_overlay_selected; then
+        local coop_src
+        coop_src="$(_glm53_coop_src_dir)" || { echo "cooperative artifacts missing" >&2; return 2; }
+        if [ -f "$coop_src/manifest.json" ]; then
+            python3 "$SCRIPT_DIR/extensions/cooperative_moe/tp3/manifest.py" verify-artifacts "$coop_src" || return
+        fi
+    fi
+    local loader_key
+    for loader_key in INSTANTTENSOR_CACHE_BUFFER INSTANTTENSOR_BUFFER_SIZE; do
+        if [ -n "${!loader_key:-}" ] && ! [[ "${!loader_key}" =~ ^[0-9]+$ ]]; then
+            echo "$loader_key must be an integer" >&2; return 2
+        fi
+    done
+    _glm53_validate_enum HAREM_KDA_FLASHKDA "$HAREM_KDA_FLASHKDA" 0 1 || return
+    if [ "$HAREM_KDA_FLASHKDA" = 1 ] && [ ! -f "$FLASHKDA_PATCH_HOST" ]; then
+        echo "FlashKDA patch missing: $FLASHKDA_PATCH_HOST" >&2; return 2
     fi
     if [ -n "${GLM53_COOP_GEOMETRY:-}" ]; then
         _glm53_validate_enum GLM53_COOP_GEOMETRY "$GLM53_COOP_GEOMETRY" 0 1 2 || return
@@ -903,6 +964,8 @@ preflight() {
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
+    [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
+    [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
     [ -f "$SCRIPT_DIR/ablit/LAYER_MAP.json" ] || die "$SCRIPT_DIR/ablit/LAYER_MAP.json missing"
@@ -1473,6 +1536,9 @@ fi
 if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
     python3 /opt/glm53/patch_hybrid_prefix_hit.py
 fi
+if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
+    python3 /opt/glm53/patch_apc_per_group_retention.py
+fi
 if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
     python3 /opt/glm53/patch_xgrammar_termination.py
 fi
@@ -1489,6 +1555,9 @@ if [ -f /opt/glm53/patch_adaptive_k.py ]; then
 fi
 if [ -f /opt/glm53/patch_dense_fp8.py ]; then
     python3 /opt/glm53/patch_dense_fp8.py
+fi
+if [ "${HAREM_KDA_FLASHKDA:-0}" = 1 ]; then
+    python3 /opt/glm53/patch_flashkda_tp3.py --root /usr/local/lib/python3.12/dist-packages --in-place
 fi
 # AFTER patch_dense_fp8: it reinstalls exl3.py from /opt/glm53, which would
 # otherwise wipe both EP fixes below.
@@ -1606,6 +1675,9 @@ fi
 if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
     python3 /opt/glm53/patch_hybrid_prefix_hit.py
 fi
+if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
+    python3 /opt/glm53/patch_apc_per_group_retention.py
+fi
 if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
     python3 /opt/glm53/patch_xgrammar_termination.py
 fi
@@ -1622,6 +1694,9 @@ if [ -f /opt/glm53/patch_adaptive_k.py ]; then
 fi
 if [ -f /opt/glm53/patch_dense_fp8.py ]; then
     python3 /opt/glm53/patch_dense_fp8.py
+fi
+if [ "${HAREM_KDA_FLASHKDA:-0}" = 1 ]; then
+    python3 /opt/glm53/patch_flashkda_tp3.py --root /usr/local/lib/python3.12/dist-packages --in-place
 fi
 # AFTER patch_dense_fp8: it reinstalls exl3.py from /opt/glm53, which would
 # otherwise wipe both EP fixes below.
@@ -1665,10 +1740,12 @@ _tp3_scp_runtime() {
     scp -q -o BatchMode=yes "$SCHED_PATCH_HOST" "${ssh_t}:/tmp/patch_scheduler_decode_floor.py"
     scp -q -o BatchMode=yes "$DRAFTER_PATCH_HOST" "${ssh_t}:/tmp/patch_glm5_drafter_group.py"
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${ssh_t}:/tmp/patch_hybrid_prefix_hit.py"
+    scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${ssh_t}:/tmp/patch_apc_per_group_retention.py"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${ssh_t}:/tmp/patch_xgrammar_termination.py"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${ssh_t}:/tmp/patch_kpool_tail_slotmap.py"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${ssh_t}:/tmp/patch_spinwait.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${ssh_t}:/tmp/glm53-exl3.py"
+    scp -q -o BatchMode=yes "$FLASHKDA_PATCH_HOST" "${ssh_t}:/tmp/patch_flashkda_tp3.py"
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${ssh_t}:/tmp/patch_adaptive_k.py"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${ssh_t}:/tmp/patch_dense_fp8.py"
     if [ -d "$TP3_OVERLAY_HOST" ]; then
@@ -1695,6 +1772,16 @@ _glm53_coop_overlay_selected() {
 _glm53_coop_src_dir() {
     local dir
     dir="$(dirname -- "$EXL3_OVERLAY_HOST")"
+    if grep -Fq '# Explicit TP3 ABI2 cooperative adapter; complete manifest required on all ranks.' "$EXL3_OVERLAY_HOST"; then
+        # ABI2 is an explicit bundle: never substitute a stale cache or silently
+        # downgrade to the legacy two-file path when its manifest is missing.
+        if [ ! -f "$dir/manifest.json" ] || [ ! -f "$dir/runtime.py" ] || [ ! -f "$dir/cooperative_moe.so" ]; then
+            echo "TP3 ABI2 overlay requires a complete manifest bundle beside it" >&2
+            return 1
+        fi
+        printf '%s\n' "$dir"
+        return 0
+    fi
     if [ -f "$dir/runtime.py" ] && [ -f "$dir/cooperative_moe.so" ]; then
         printf '%s\n' "$dir"
         return 0
@@ -1711,6 +1798,22 @@ _tp3_stage_coop_runtime() {
     local src dest r ssh_t
     _glm53_coop_overlay_selected || return 0
     src="$(_glm53_coop_src_dir)" || die "cooperative overlay $EXL3_OVERLAY_HOST needs runtime.py and cooperative_moe.so beside it or in $CACHE_ROOT/cooperative_moe (container path /root/.cache/vllm/cooperative_moe)"
+    if [ -f "$src/manifest.json" ]; then
+        python3 "$SCRIPT_DIR/extensions/cooperative_moe/tp3/manifest.py" verify-artifacts "$src" || die "invalid TP3 cooperative bundle"
+        if [ "$src" != "$CACHE_ROOT/cooperative_moe" ]; then
+            mkdir -p "$CACHE_ROOT/cooperative_moe"
+            python3 "$SCRIPT_DIR/extensions/cooperative_moe/tp3/stage_bundle.py" "$src" "$CACHE_ROOT/cooperative_moe"
+            src="$CACHE_ROOT/cooperative_moe"
+        fi
+        for r in 1 2; do
+            ssh_t="$(_tp3_ssh_target "$r")"
+            dest="$(_tp3_rank_vllm "$r")/cooperative_moe"
+            worker_ssh_n "$r" "mkdir -p '$dest'"
+            scp -q -r -o BatchMode=yes "$src/." "${ssh_t}:${dest}/"
+            log "TP3 cooperative manifest bundle staged on rank ${r}"
+        done
+        return 0
+    fi
     mkdir -p "$CACHE_ROOT/cooperative_moe"
     if [ "$src" != "$CACHE_ROOT/cooperative_moe" ]; then
         install -m 644 "$src/runtime.py" "$src/cooperative_moe.so" "$CACHE_ROOT/cooperative_moe/"
@@ -1816,8 +1919,17 @@ TP3_SKIP_OLD_SCP
         -e VLLM_NO_USAGE_STATS=1
         -e DO_NOT_TRACK=1
         -e PYTHONFAULTHANDLER=1
+        -e "HAREM_KDA_FLASHKDA=$HAREM_KDA_FLASHKDA"
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL:-}" ]; then
+        nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=$GLM53_APC_RETENTION_INTERVAL")
+        log "global prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL} (all ranks)"
+    fi
+    if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ]; then
+        nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
+        log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (all ranks)"
+    fi
     [[ "$NCCL_MIN_NCHANNELS" =~ ^[1-9][0-9]*$ && "$NCCL_MAX_NCHANNELS" =~ ^[1-9][0-9]*$ ]] \
         || die "NCCL_MIN/MAX_NCHANNELS must be positive integers (got MIN=${NCCL_MIN_NCHANNELS} MAX=${NCCL_MAX_NCHANNELS})"
     log "NCCL channels pinned MIN=${NCCL_MIN_NCHANNELS} MAX=${NCCL_MAX_NCHANNELS} (all ranks)"
@@ -1855,8 +1967,17 @@ TP3_SKIP_OLD_SCP
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
-             GLM53_COOP_GEOMETRY; do
+             GLM53_COOP_GEOMETRY HAREM_KDA_FLASHKDA; do
         serve_env+=" -e $v='${!v:-}'"
+    done
+    # Optional loader tuning is forwarded only when supplied; image defaults
+    # remain intact for existing profiles.
+    for v in INSTANTTENSOR_CACHE_BUFFER INSTANTTENSOR_BUFFER_SIZE; do
+        if [ -n "${!v:-}" ]; then
+            [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be an integer"
+            serve_env+=" -e $v='${!v}'"
+            nccl_common+=(-e "$v=${!v}")
+        fi
     done
     # VLLM_API_KEY is read by the head (rank 0) API server for bearer auth; the
     # worker runs --headless so it only needs the var for argv-parity, and
@@ -1894,12 +2015,14 @@ TP3_SKIP_OLD_SCP
             -v '/tmp/patch_scheduler_decode_floor.py:/opt/glm53/patch_scheduler_decode_floor.py:ro' \
             -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
             -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
+            -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
             -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
             -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
             -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
             -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
             -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
             -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+            -v '/tmp/patch_flashkda_tp3.py:/opt/glm53/patch_flashkda_tp3.py:ro' \
             -v '/tmp/glm53-tp3/patch_tp3_glm.py:/opt/glm53/patch_tp3_glm.py:ro' \
             -v '/tmp/glm53-tp3/patch_exl3_ep_shard.py:/opt/glm53/patch_exl3_ep_shard.py:ro' \
             -v '/tmp/glm53-tp3/patch_exl3_expert_map.py:/opt/glm53/patch_exl3_expert_map.py:ro' \
@@ -1938,12 +2061,14 @@ TP3_SKIP_OLD_SCP
         -v "$SCHED_PATCH_HOST:/opt/glm53/patch_scheduler_decode_floor.py:ro" \
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
+        -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$FLASHKDA_PATCH_HOST:/opt/glm53/patch_flashkda_tp3.py:ro" \
         -v "$TP3_OVERLAY_HOST/patch_tp3_glm.py:/opt/glm53/patch_tp3_glm.py:ro" \
         -v "$TP3_OVERLAY_HOST/patch_exl3_ep_shard.py:/opt/glm53/patch_exl3_ep_shard.py:ro" \
         -v "$TP3_OVERLAY_HOST/patch_exl3_expert_map.py:/opt/glm53/patch_exl3_expert_map.py:ro" \
@@ -2162,7 +2287,7 @@ start() {
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} adaptive-k=${GLM53_ADAPTIVE_K} set=${GLM53_ADAPTIVE_K_SET} alpha=${GLM53_ADAPTIVE_K_ALPHA} dense_fp8=${GLM53_DENSE_FP8} coop_geometry=${GLM53_COOP_GEOMETRY:-} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} adaptive-k=${GLM53_ADAPTIVE_K} set=${GLM53_ADAPTIVE_K_SET} alpha=${GLM53_ADAPTIVE_K_ALPHA} dense_fp8=${GLM53_DENSE_FP8} overlay=${EXL3_OVERLAY_HOST} coop_geometry=${GLM53_COOP_GEOMETRY:-} flashkda=${HAREM_KDA_FLASHKDA} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED}"
 
     launch_cluster
     if wait_for_health; then

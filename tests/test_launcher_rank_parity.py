@@ -20,7 +20,7 @@ Hardening asked for by the production-like tester run on PRs #83/#84:
   D  Rank parity -- for every /opt/glm53 patch the head bind-mounts host
      file S, the worker's mount is fed from /tmp/X and the scp that produced
      /tmp/X read the same S; both ranks receive identical effective retention,
-     no-store, KV-capacity-log and cache-reset values;
+     no-store, KV-capacity-log, thin-decode and cache-reset values;
      a knob the launcher wires must be PRESENT on both ranks, not merely
      equal. The comparison itself is exercised with a synthetic one-rank
      mismatch so a silent pass cannot hide behind equality.
@@ -65,9 +65,13 @@ NS_FORWARD = '-e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"'
 CR = "GLM53_EXPOSE_CACHE_RESET"
 KV = "GLM53_KV_CAPACITY_LOG"
 KV_FORWARD = '-e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"'
+# Opt-in thin EXL3 decode dispatch: wired on both ranks (head explicitly, worker
+# through the serve_env list). A one-rank miss would silently disable the kernel on
+# that rank, so the scenarios below always require it.
+THIN = "GLM53_EXL3_MOE_FAST"
 
 # Launcher knobs and the container-side names they map to.
-LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, NS, KV)
+LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, NS, KV, THIN)
 CONTAINER_NAMES = LAUNCHER_KNOBS + (
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA",
@@ -635,6 +639,9 @@ def part_d(h: Harness) -> None:
     scenarios.append((f"{CR}=1", {CR: "1"}))
     if wires_kv():
         scenarios += [("KVCAP=0", {KV: "0"}), ("KVCAP=1", {KV: "1"})]
+    # Unconditional: this checkout ships the thin-decode wiring, so a dropped
+    # or one-rank-missing forward must fail D2 rather than skip the scenario.
+    scenarios += [("FAST=0", {THIN: "0"}), ("FAST=1", {THIN: "1"})]
 
     first = None
     for label, env in scenarios:
@@ -652,6 +659,8 @@ def part_d(h: Harness) -> None:
         required[CR] = env.get(CR, "0")
         if KV in env:
             required[KV] = env[KV]
+        if THIN in env:
+            required[THIN] = env[THIN]
         issues = parity_issues(head, worker, scp, required)
         check(not issues, f"D2 [{label}] rank parity: " + ("; ".join(issues) if issues else "no differences"))
         for name in CONTAINER_NAMES:

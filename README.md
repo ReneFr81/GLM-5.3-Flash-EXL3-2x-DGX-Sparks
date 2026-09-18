@@ -19,6 +19,11 @@ A **3×** sibling is `./start-tp3.sh` on the same image and weights (see
 [3× Spark (TP=3)](#3x-spark-tp3)). Served model id: **`GLM-5.3-Flash-EXL3`**. EXL3/TR3 quant by
 [brandonmusic](https://huggingface.co/brandonmusic).
 
+Optional TP3 contribution for evaluation: [cooperative ABI2, 64-row support,
+FlashKDA and combined-profile measurements](docs/tp3-throughput-results.md).
+Historical measurements and pending validation of the upstream-based branch
+are documented separately; existing defaults are unchanged.
+
 This is **EXL3 weights + fp8 KV** on GB10. Do not pass `--moe-backend marlin`.
 The Hub card on brandonmusic (TP2/EP2/DCP2 + calibrated NVFP4 MLA KV) is the SM120 B12X
 image (`verdictai/glm53-flash-exl3-k4:…-v84-dflash2`), not this overlay. Target KV
@@ -26,6 +31,9 @@ stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 ([incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2));
 draft attention is **FLASH_ATTN** (do not pin `TRITON_ATTN` — that mask is causal
 inside the draft block on this image and collapses later-position accept).
+
+Release notes from the initial 1.0.0 recipe through **1.6.0** are in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
 
@@ -88,14 +96,20 @@ Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1�
 
 That 2026-08-28 decode serve used `--max-model-len 1000000` with a **1,754,237-token** KV pool. These runs are warm / empty KV — they do not need a filled 1M cache.
 
-**Prose** (sparkDash Decode bench, prose prompt type, 2026-09-08) on the adaptive-verification + FP8-dense serve
-(`GLM53_ADAPTIVE_K=ema`, `GLM53_DENSE_FP8=dense,kda`, 850k context, KV pool capped at 14 GiB — turned on
-as below; the stock k=7 / BF16 serve measured ~18–27 tok/s per stream on the lab prose prompts):
+**Prose** (sparkDash Decode bench, prose prompt type, 2026-09-17, thinking
+**off**) on this 2× kit (`GLM53_ADAPTIVE_K=ema`, `GLM53_DENSE_FP8=dense,kda`,
+cooperative MoE overlay, 850k context, KV pool capped at 14 GiB). Stream is
+per request; aggregate is all streams.
 
 | Concurrency | TTFT | Stream tok/s | Aggregate tok/s |
 |---|---:|---:|---:|
-| **×1** | **268 ms** | **32.1** | **32.1** |
-| **×2** | 399 ms | 22.1 | 41.2 |
+| **×1** | **333 ms** | **36.1** | **37.1** |
+| **×2** | 365 ms | 25.0 | 51.1 |
+| **×3** | 405 ms | 22.3 | 65.8 |
+| **×4** | 401 ms | 19.4 | 75.3 |
+
+The 2026-09-08 adaptive-k + dense-FP8 table (no coop overlay in that write-up)
+was ×1 **32.1** / ×2 **22.1** stream (**41.2** agg), TTFT 268 / 399 ms.
 
 ### Opt-in cooperative decode MoE
 
@@ -107,7 +121,7 @@ and `overlay/exl3.py` stay stock until you select a generated overlay with
 `EXL3_OVERLAY_HOST`.
 
 Do not load the DS4.1 cooperative `.so` here. Serving measurements vs the
-tables above (prose ×1/×2 32.1 / 41.2 agg, structured ×1 62.9) are recorded
+tables above (prose ×1 **37.1** / ×2 **51.1** agg, structured ×1 62.9) are recorded
 after the GPU gate in [`docs/cooperative-moe.md`](docs/cooperative-moe.md).
 Live operator handoff (geometry 1, rollback, pins):
 [`docs/cooperative-moe-handoff.md`](docs/cooperative-moe-handoff.md).
@@ -593,8 +607,9 @@ took 112.49 s instead of 14.70 s, and a branch at 90% took 99.89 s instead of
 111,104. All tested answers were correct. These are sequential histories,
 not four simultaneously active 210K streams.
 
-The global launcher spelling is `GLM53_APC_RETENTION_INTERVAL` (TP=2 only).
-Leave it unset for normal use; TP=4 rejects either retention override.
+The global launcher spelling is `GLM53_APC_RETENTION_INTERVAL` (leave unset
+for a dense MLA/mamba grid). `start.sh`, `start-tp3.sh`, and `start-tp4.sh`
+all forward `GLM53_APC_RETENTION_INTERVAL_SWA`.
 
 Both retention knobs remain unset by default. Keep that default unless the
 tradeoff fits the workload. SWA-only sparse retention with a dense target is
@@ -820,11 +835,21 @@ reordering `NCCL_IB_HCA` does not help (NCCL enumerates devices in system
 order). Put the control plane on the management LAN (`SOCKET_IFNAME`); keep
 data on RoCE via `NCCL_IB_HCA`.
 
-Decode on this kit (2026-09-14, temp 0, thinking off, 400 tok, median of 3;
-count / hashmap / LRU-code): structured **87.8**, code **54.9**, prose **39.6**,
-TTFT **0.25 s**. Same prompts, TP=2: 73.4 / 45.0 / 32.9 / 0.33 s. jspark3's
-3× stack is still ahead on structured (~95 tok/s) — `DFLASH_DRAFT_TP=1` is the
-divisibility tax.
+**Prose** (sparkDash Decode bench, 2026-09-17, thinking **off**, 512 tok,
+1–4 concurrent) on this 3× kit:
+
+| Concurrency | TTFT | Stream tok/s | Aggregate tok/s |
+|---|---:|---:|---:|
+| **×1** | **255 ms** | **40.1** | **40.1** |
+| **×2** | 411 ms | 28.7 | 56.6 |
+| **×3** | 323 ms | 25.5 | 75.5 |
+| **×4** | 351 ms | 22.8 | 88.4 |
+
+Earlier lab medians on this kit (2026-09-14, temp 0, thinking off, 400 tok,
+median of 3; count / hashmap / LRU-code): structured **87.8**, code **54.9**,
+prose **39.6**, TTFT **0.25 s**. Same prompts, TP=2: 73.4 / 45.0 / 32.9 / 0.33 s.
+jspark3's 3× stack is still ahead on structured (~95 tok/s) —
+`DFLASH_DRAFT_TP=1` is the divisibility tax.
 
 Shape overlays and the two EP loader traps: [`overlay/tp3/README.md`](overlay/tp3/README.md).
 The flags and overlays come from
@@ -1031,7 +1056,7 @@ that are now documented/enforced:
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` when unset | TP=2 `start.sh` passes the effective value to both ranks. An explicit empty value disables this option; caller exports, including empty, override `.env`. Changing allocator settings requires a restart and separate memory/connector qualification; TP=4 is unchanged |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
-| `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | TP=2 DFlash2 drafter retention. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. TP=4 rejects a non-empty value. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
+| `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | DFlash2 drafter retention on TP=2/3/4. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
 | `GLM53_APC_NO_STORE` | `1` | honour a client's per-request GPU prefix-cache **no-store** flag (overlay `patch_apc_no_store.py`; see [Opting a request out of the prefix cache](#opting-a-request-out-of-the-prefix-cache)). Requests never opt in on their own, so `1` changes nothing until a client sends the flag. `0` = ignore the flag (logged once); malformed values are rejected either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (N = max_concurrency × max_model_len, **not** a pool size) log one line per KV-cache group and a summary with the usable block ids, the ids one aligned cached segment costs across groups and the resulting cached-conversation capacity (overlay `patch_kv_capacity_log.py`; see [What the KV cache boot line means](#what-the-kv-cache-boot-line-means)). `0` = off (one line saying so). Log-only, no serving change either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_MIXED_PREFILL_CHUNK` | `fair` (`start.sh`, `start-tp3.sh`, `start-tp4.sh`, `.env.example`, `.env.tp3.example`, `.env.tp4.example`) | Mixed-prefill policy while a peer decodes. **`skip` starves prefills until decode ends** (the reported multi-minute newcomer freeze). `N>0` caps mixed chunks with hybrid alignment support; `0`/`off` disables isolation (admits newcomers in ~1 s but collapses the incumbent 10–36× on TP=2). `fair` v5 allocates decodes first, charges only prefill that contends with a decoder, fits a fixed-plus-per-token step cost, runs the largest chunk that fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, and gives a newcomer one prompt probe. Measured on TP=2 (reporter recipe, thinking essay at ~24 tok/s): 2k newcomer first token ~12 s, 30k newcomer ~164 s while the essay still streams, incumbent keeps ~80–90% of its in-run rate. TP=3 same recipe: 2k in 8.7 s, 30k in 110 s, both during the essay, incumbent ~83–87%. TP=4 inherits the same default; that topology was not re-measured. See [receipts](docs/diditfix.md) and [design](docs/astra-fix.md). |
@@ -1058,8 +1083,11 @@ that are now documented/enforced:
 | `HEAD_CX7_IF` / `WORKER_CX7_IF` | `enp1s0f1np1` / `enp1s0f0np0` | NCCL sockets |
 | `HEAD_CX7_IB` / `WORKER_CX7_IB` | `rocep1s0f1` / `rocep1s0f0` | NCCL HCAs |
 | `USE_HOST_NCCL` | `0` | image nvidia-nccl; host preload duplicates DeepEP |
+| `GLM53_EXL3_MOE_FAST` | `0` | opt-in SM121 K4/N256 **thin-decode** kernels for routed experts (`overlay/patch_exl3_decode_pipeline.py`; see [docs/sm121-perf-paths.md](docs/sm121-perf-paths.md)). `1` needs an image built with that patch and requires the fused `exl3_moe` path — otherwise model load raises instead of silently degrading (also under `EXL3_FUSED_MOE=0`). Exactly `0` or `1`; the launcher refuses anything else, including explicit empty, before `restart` stops the pair. TP=2 only; the TP3 launcher keeps unsetting it |
 
 `DEFAULT_MAX_NEW_TOKENS` preserves omitted completion limits through Pydantic normalization; an explicit `max_tokens: null` retains the pinned runtime's native normalization to 16. The overlay validates the limiter, completion caller, and protocol validator before writing any target. The CPU regression (`python3 tests/test_gen_defaults.py`) requires Pydantic v2 and exercises its real before-validator, not fabricated field-set metadata.
+
+Native thin-kernel qualification uses `tests/test_exl3_thin_fast_gpu.py` and `tests/compare_thin_fast.py` with stock/candidate/stock receipts before timing `tests/bench_exl3_thin.py`. The fixtures route each token to eight distinct experts from a 32-expert pool. Uniform, correlated and hot-expert cases must never route a token to the same expert twice; `tests/test_exl3_routing.py` checks this on CPU. Receipts from the older with-replacement fixtures do not establish parity for valid top-k routing. Maintainer-measured TheGrill v0.3.0 A/B/A2 on current `main` (`glm-routine-decode-v3`, image `sha256:f267534b…`, fresh boot per arm, descriptive — no PASS envelope) gives **+7.71% / +8.88% / +14.59%** median decode rate in the three cells whose ranges resolve, with an A2-vs-A drift of −0.31% / +0.30% / −3.54%; two cells are withheld by the tool's range-overlap rule. These checks alone do not qualify full-model quality or speed, and the hash-frozen numerical study for this path is formally **inconclusive**: both predeclared control self-tests fail on unchanged stock repeats (the absolute-KL gate and the tau-transfer bound), so no claim here is a pass — see [docs/sm121-perf-paths.md](docs/sm121-perf-paths.md) for the recorded numbers and limits.
 
 **Default from this checkout:** E2 fat kernel on (`EXL3_FAT_KERNEL=1`) and `MAX_NUM_BATCHED_TOKENS=7168`; the E3 grouped tier is the launcher default (`EXL3_FAT_GROUPED=1`, see *Cold prefill (E3)*). The pre-E2 C4 keep was 2048; the current E2 cold-prefill baseline is the linked PR77 table; E2 at 7168 is ~1,150–1,185 tok/s cold, E3 ~1,580–1,640.
 ## Opting a request out of the prefix cache
@@ -1174,12 +1202,14 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/exl3_fat_moe.cu` / `.cuh` | E3 grouped fat-expert kernels (gather / gate-up+SwiGLU / down+scatter); compiled into `exllamav3_ext` by the full build, or as the additive `exl3_fat_moe_ext` module by `Dockerfile.e3-layer` + `overlay/build_exl3_fat_moe_ext.py` |
 | `tests/bench_e3_microbench.py` | CUDA-event MoE-layer timing E2 vs E3 + production-geometry parity (isolated, serving stopped) |
 | `overlay/patch_exl3_ext_aarch64.py` | stub AVX CPU allreduce so the ext builds on GB10 |
+| `overlay/patch_exl3_decode_pipeline.py` | additive SM121 K4/N256 thin-decode kernels (shared / independent gate-up transform) + `glm53_fast_moe_version` in `exllamav3_ext`; stock kernels untouched, every anchor validated before anything is written |
+| `tests/test_exl3_decode_pipeline.py` | CPU: patch anchors, double-apply and partial-write refusal, gate/up SUH alias gate, `GLM53_EXL3_MOE_FAST` 0/1 contract, and the load-time fail-closed paths (no native symbol, wrong version, fused path unavailable) |
 | `overlay/patch_model_overrides.py` | `"exl3"` in ModelConfig overrides |
 | `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0`, E2 diag schema, E3 grouped tables/parity/graph-replay/fallback checks |
 | `tests/test_apc_per_group_retention.py` | host: overlay apply/idempotence, min-exemption derivation, routing, env validation, composition with `patch_hybrid_prefix_hit.py` in both orders, id-cost/capacity arithmetic (needs `GLM53_KV_COORDINATOR_PY_SRC` + `_PRISTINE` copies of the fork's coordinator) |
 | `overlay/patch_apc_no_store.py` | per-request GPU prefix-cache no-store (`skip_writing_prefix_cache` / `vllm_xargs`): strict 0/1 validation in `SamplingParams.__post_init__`, never-raising resolver on `Request`, guards at the two `_insert_block_hash` sites in `BlockPool`; transactional, fail-closed; kill switch `GLM53_APC_NO_STORE` |
 | `tests/test_apc_no_store.py` | host: apply / idempotence / drift with nothing written / partial-application refusal; resolver accept-reject and kill-switch behavior; on CPU vLLM (`GLM53_VLLM_SRC_ROOT`, mandatory in the image): real `BlockPool` free-queue policy, chunked-prefill bookkeeping parity, hybrid partial-tail producer/reader/CoW, seven-group fork layout, env-driven retention and cache lookup, preemption, `skip_reading`+`skip_writing`, and log receipts |
-| `tests/test_launcher_rank_parity.py` | launcher (CPU-only, docker/ssh stubbed): retention and kill-switch validation, pre-stop artifact checks, ordered hybrid/per-group/no-store overlays (kv-capacity-log after its shared-file drafter-group patch and before xgrammar), and matching rank environments and mounts including no-store, KV-capacity-log, and cache-reset values |
+| `tests/test_launcher_rank_parity.py` | launcher (CPU-only, docker/ssh stubbed): retention and kill-switch validation, pre-stop artifact checks, ordered hybrid/per-group/no-store overlays (kv-capacity-log after its shared-file drafter-group patch and before xgrammar), and matching rank environments and mounts including no-store, KV-capacity-log, thin-decode, and cache-reset values |
 | `tests/bench_decode.py` | streaming decode + coherence; `--structured` is the count-1→200 median |
 | `tests/test_start_overrides.py` | CPU-only caller precedence: `.env` keys, empty exports, shell assignments, and child inheritance |
 | `tests/test_launcher_extra_env.py` | launcher (CPU-only, docker/ssh stubbed): non-owned `GLM53_EXTRA_ENV` diagnostics reach both ranks as `-e` pairs, launcher-owned names fail the launch before any container starts, values stay out of the log, and malformed entries are rejected by position without echoing any fragment |
@@ -1213,6 +1243,8 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_indexer_workspace.py` | sizing formula (MNBT/`max_num_seqs`/spec-token edge cases, stock clamp), chunk-list equivalence vs stock by exhaustion, exact three-site patch, idempotence, fail-closed drift, launcher wiring |
 | `overlay/patch_spinwait.py` | opt-in numeric `GLM53_SPINWAIT_MS`: fail-closed runtime patch of SpinCondition's reader busy-loop window on both ranks |
 | `tests/test_spinwait_patch.py` | numeric contract, exact patch, idempotence, drift rejection, mode preservation, pyc cleanup, and launcher/build wiring |
+| `overlay/patch_tool_choice_none.py` | honor `tool_choice:"none"` at decode time: keep tools in the prompt, mask the `<tool_call>` opener via `bad_words` (glm47 parser hook); see `docs/tool-choice-none.md` |
+| `tests/test_tool_choice_none.py` | exact patch, idempotence, fail-closed drift, none+tools masking, client `bad_words` union, auto/required/no-tools/Responses untouched |
 | `overlay/ablit_runtime.py` | load-time o_proj transplant / projection (`ABLIT=1`); no-op when off |
 | `overlay/patch_ablit.py` | install the load_weights hook; bind-mounted and run on both ranks |
 | `ablit/` | direction vectors + `LAYER_MAP.json` from drowzeys' published recipe; `fetch_transplant.py` + `transplant/` for the donor o_proj byte-copy |
@@ -1220,6 +1252,7 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_default_reasoning_effort.sh` | `GLM53_DEFAULT_REASONING_EFFORT` enum guard (`""`/`low`/`high`/`max`; `medium` rejected) and the `--default-chat-template-kwargs` flag at both rank sites, sliced out of `start.sh` and evaluated |
 | `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
 | `tests/test_boot_shape_warmup.py` | the shipped warmup script end-to-end with `WARMUP_CURL` stubbed: all 9 ladder/prefill prompts (65536 rung included) arrive byte-exact, the 24-request tally holds, and the tokenize-mismatch / smaller-context runs exit 1 while still warming the rest |
+| `scripts/tool-choice-none-preflight.py` | pre-generation gates for the `tool_choice:none` live test: identity/launch flags, enforcement-chain digests, tokenizer opener-mask dry run (`docs/tool-choice-none.md`) |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.

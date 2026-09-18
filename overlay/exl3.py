@@ -1246,9 +1246,35 @@ def apply_exl3_grouped_fat(
     _EXL3_FAT_DIAG["grouped_calls"] += 1
 
 
+def exl3_moe_fast_requested() -> bool:
+    """Opt-in SM121 K4/N256 thin-decode dispatch (default off).
+
+    Mirrors the native dispatcher's validation: anything other than 0/1
+    raises at load instead of surfacing as a native TORCH_CHECK on the
+    first decode call.
+    """
+    raw = os.environ.get("GLM53_EXL3_MOE_FAST", "0")
+    if raw not in ("0", "1"):
+        raise RuntimeError("GLM53_EXL3_MOE_FAST must be 0 or 1")
+    return raw == "1"
+
+
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
     """Pointer tables + fused temps, once after load. No per-token alloc."""
     import exllamav3_ext
+
+    # Fail closed: an explicitly requested fast thin-decode path must never
+    # silently run the stock kernel on an image built without it.
+    fast = exl3_moe_fast_requested()
+    if fast:
+        if not hasattr(exllamav3_ext, "glm53_fast_moe_version"):
+            raise RuntimeError(
+                "GLM53_EXL3_MOE_FAST=1 requires the native decode-pipeline "
+                "image (exllamav3_ext.glm53_fast_moe_version); this image "
+                "was built without overlay/patch_exl3_decode_pipeline.py"
+            )
+        if exllamav3_ext.glm53_fast_moe_version() != 1:
+            raise RuntimeError("Unsupported native EXL3 decode-pipeline version")
 
     device = layer.w13_trellis.device
     n_exp = len(inners)
@@ -1273,6 +1299,17 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         "down_suh": _ptrs("down", "suh"),
         "down_svh": _ptrs("down", "svh"),
     }
+    # Gate/up SUH equality was verified across every expert at load time
+    # (layer._exl3_shared_w13_suh, torch.equal on the packed tensors),
+    # before weights were released. Aliasing the pointer tables is what lets
+    # the native fast path prove the reuse predicate by pointer identity
+    # (gate_ptrs_suh.data_ptr() == up_ptrs_suh.data_ptr()) and skip the
+    # redundant up-input Hadamard. Only the fast path needs it, so FAST=0
+    # leaves the tables exactly as the stock path builds them; FAST=1 with an
+    # unequal checkpoint keeps both tables and takes the independent-transform
+    # fast kernel.
+    if fast and bool(getattr(layer, "_exl3_shared_w13_suh", False)):
+        layer._exl3_ptrs["up_suh"] = layer._exl3_ptrs["gate_suh"]
     idx = int(device.index) if device.index is not None else 0
     concurrency = int(exllamav3_ext.exl3_moe_max_concurrency(idx))
     if concurrency < 1:
@@ -2091,6 +2128,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             except Exception as exc:
                 fused_err = repr(exc)
                 layer._exl3_ptrs = None
+        if exl3_moe_fast_requested() and not fused_ok:
+            # Fail closed: an explicitly requested fast thin-decode path must
+            # never silently run the stock kernel or the Python loop. The
+            # version gate inside build_exl3_fused_state raises through the
+            # same path; this also covers fused disabled / exl3_moe missing.
+            raise RuntimeError(
+                "GLM53_EXL3_MOE_FAST=1 requires the fused exl3_moe path on an "
+                "image built with overlay/patch_exl3_decode_pipeline.py; "
+                f"load-time setup failed: {fused_err or 'EXL3_FUSED_MOE=0'}"
+            )
         if not self._logged:
             if fused_ok:
                 logger.info(
