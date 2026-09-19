@@ -42,7 +42,9 @@ def test_max_num_seqs_inline_override_wins() -> None:
     assert result.stdout.strip() == "MAX_NUM_SEQS=4"
 
 
-def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
+def _run_preamble_proc(
+    env_file: str, caller: dict[str, str], probe: str
+) -> subprocess.CompletedProcess[str]:
     """Run start.sh's pre-configuration preamble with a synthetic .env."""
     source = (ROOT / "start.sh").read_text()
     marker = "# ----------------------------- configuration -------------------------------"
@@ -58,10 +60,14 @@ def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
 
         env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53"}
         env.update(caller)
-        result = subprocess.run(
+        return subprocess.run(
             ["bash", str(script)], check=True, capture_output=True, text=True, env=env
         )
-    return result.stdout.strip()
+
+
+def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
+    """Stdout of the preamble run, stripped."""
+    return _run_preamble_proc(env_file, caller, probe).stdout.strip()
 
 
 def test_default_reasoning_effort_caller_override_is_setness_aware() -> None:
@@ -175,7 +181,28 @@ def test_shell_assignments_preserve_caller_values() -> None:
     )
 
 
+def _run_preamble_stderr(env_file: str, caller: dict[str, str]) -> str:
+    """Stderr of the preamble run with no probe appended."""
+    return _run_preamble_proc(env_file, caller, "\n").stderr
+
+
+def test_ambient_override_of_model_affecting_key_is_announced() -> None:
+    """#168: an inherited env value that displaces .env for a model-affecting key is
+    named on stderr, with both values. Silent when nothing diverges."""
+    dotenv = "HF_HOME=/from/dotenv\nMODEL=from/dotenv\nMAX_NUM_SEQS=2\n"
+    err = _run_preamble_stderr(dotenv, {"HF_HOME": "/from/ambient"})
+    assert "NOTE: HF_HOME=/from/ambient from the environment overrides .env value /from/dotenv" in err
+    assert err.count("NOTE:") == 1
+    # ambient value equal to .env: nothing to report
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {"HF_HOME": "/from/dotenv"})
+    # clean environment: nothing to report
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {})
+    # an unwatched key still wins (PR #161) and is not announced
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {"MAX_NUM_SEQS": "4"})
+
+
 if __name__ == "__main__":
+    test_ambient_override_of_model_affecting_key_is_announced()
     test_every_env_example_key_preserves_caller_setness()
     test_shell_assignments_preserve_caller_values()
     test_max_num_seqs_inline_override_wins()
